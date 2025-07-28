@@ -34,8 +34,12 @@ class AntiSlopSampler:
         inference_output=None,
         debug_output=None,
         regex_bans: List[str] = [],
-		enforce_json: bool = False,
+        enforce_json: bool = False,
         antislop_enabled: bool = True,
+        repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        no_repeat_ngram_size: int = 0,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -49,6 +53,10 @@ class AntiSlopSampler:
         self.enforce_json = enforce_json
         self.antislop_enabled = antislop_enabled
         self.regex_bans = regex_bans or []
+        self.repetition_penalty = repetition_penalty
+        self.presence_penalty = presence_penalty
+        self.frequency_penalty = frequency_penalty
+        self.no_repeat_ngram_size = no_repeat_ngram_size
 
         self.sequence_queue = queue.Queue()
         self.generation_complete = threading.Event()
@@ -191,6 +199,10 @@ class AntiSlopSampler:
         top_k: int = None,
         top_p: float = None,
         min_p: float = None,
+        repetition_penalty: float = None,
+        presence_penalty: float = None,
+        frequency_penalty: float = None,
+        no_repeat_ngram_size: int = None,
     ):
         """
         Generates text in a streaming fashion with custom downregulation and backtracking.
@@ -203,10 +215,20 @@ class AntiSlopSampler:
             top_k (int): Top-k filtering.
             top_p (float): Top-p (nucleus) filtering.
             min_p (float): Minimum probability filtering.
+            repetition_penalty (float): Repetition penalty factor.
+            presence_penalty (float): Presence penalty factor.
+            frequency_penalty (float): Frequency penalty factor.
+            no_repeat_ngram_size (int): Size of n-grams that cannot be repeated.
 
         Yields:
             Generator[List[int], None, None]: Yields generated token sequences.
-        """        
+        """
+        # Use instance values if not provided
+        repetition_penalty = repetition_penalty if repetition_penalty is not None else self.repetition_penalty
+        presence_penalty = presence_penalty if presence_penalty is not None else self.presence_penalty
+        frequency_penalty = frequency_penalty if frequency_penalty is not None else self.frequency_penalty
+        no_repeat_ngram_size = no_repeat_ngram_size if no_repeat_ngram_size is not None else self.no_repeat_ngram_size
+        
         try:
             # Encode the prompt
             input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
@@ -358,8 +380,20 @@ class AntiSlopSampler:
 
 
                 if regenerating:
-                    # Apply min_p, top-k and top-p filtering
-                    filtered_probs = self._filter_probs(next_token_probs, top_k, top_p, min_p)
+                    # Apply min_p, top-k and top-p filtering with penalties
+                    # Get generated tokens (excluding prompt)
+                    generated_tokens = generated_sequence[self.prompt_length:] if len(generated_sequence) > self.prompt_length else []
+                    filtered_probs = self._filter_probs(
+                        next_token_probs, 
+                        top_k, 
+                        top_p, 
+                        min_p,
+                        repetition_penalty=repetition_penalty,
+                        presence_penalty=presence_penalty,
+                        frequency_penalty=frequency_penalty,
+                        generated_tokens=generated_tokens,
+                        no_repeat_ngram_size=no_repeat_ngram_size
+                    )
                     # Sample the next token                
                     next_token_index = torch.multinomial(filtered_probs, num_samples=1)
 
@@ -450,9 +484,46 @@ class AntiSlopSampler:
             self.generation_complete.set()
 
 
-    def _filter_probs(self, probs: torch.FloatTensor, top_k: int, top_p: float, min_p: float) -> torch.FloatTensor:
+    def _filter_probs(
+        self, 
+        probs: torch.FloatTensor, 
+        top_k: int, 
+        top_p: float, 
+        min_p: float, 
+        repetition_penalty: float = 1.0, 
+        presence_penalty: float = 0.0, 
+        frequency_penalty: float = 0.0,
+        generated_tokens: List[int] = None,
+        no_repeat_ngram_size: int = 1
+    ) -> torch.FloatTensor:
         # Make a copy of the probabilities to ensure we do not modify the original tensor
         probs = probs.clone()
+
+        # Apply repetition penalty
+        if repetition_penalty != 1.0 and generated_tokens is not None:
+            for token in set(generated_tokens):
+                probs[:, token] /= repetition_penalty
+
+        # Apply presence penalty
+        if presence_penalty != 0.0 and generated_tokens is not None:
+            for token in set(generated_tokens):
+                probs[:, token] -= presence_penalty
+
+        # Apply frequency penalty
+        if frequency_penalty != 0.0 and generated_tokens is not None:
+            token_counts = {token: generated_tokens.count(token) for token in set(generated_tokens)}
+            for token, count in token_counts.items():
+                probs[:, token] -= frequency_penalty * count
+
+        # Apply no repeat ngram penalty
+        if no_repeat_ngram_size > 0 and generated_tokens is not None:
+            ngram_set = set()
+            for i in range(len(generated_tokens) - no_repeat_ngram_size + 1):
+                ngram = tuple(generated_tokens[i:i + no_repeat_ngram_size])
+                ngram_set.add(ngram)
+            for ngram in ngram_set:
+                if len(ngram) == no_repeat_ngram_size:
+                    probs[:, ngram[-1]] = 0
 
         # Apply min_p filtering
         if min_p is not None:
@@ -460,12 +531,14 @@ class AntiSlopSampler:
             scaled_min_p = min_p * top_prob
             probs = torch.where(probs < scaled_min_p, 0, probs)
 
+        # Apply top_k filtering
         if top_k is not None and top_k > 0:
             top_k = min(top_k, probs.size(-1))
             top_k_probs, _ = torch.topk(probs, top_k)
             min_top_k = top_k_probs[:, -1].unsqueeze(-1)
             probs = torch.where(probs < min_top_k, 0, probs)
 
+        # Apply top_p filtering
         if top_p is not None and top_p < 1.0:
             sorted_probs, sorted_indices = torch.sort(probs, descending=True)
             cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
@@ -557,6 +630,10 @@ def chat_antislop(
     enforce_json: bool = False,
     antislop_enabled: bool = True,
     regex_bans: List[str] = None,
+    repetition_penalty: float = 1.0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    no_repeat_ngram_size: int = 0,
 ):
     """
     Generates a chat response while avoiding overrepresented phrases (slop) with debugging features.
@@ -614,6 +691,10 @@ def chat_antislop(
         regex_bans=regex_bans,
         streaming=streaming,
         stream_smoothing=stream_smoothing,
+        repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,
     )
     
 
@@ -640,6 +721,10 @@ def generate_antislop(
     enforce_json: bool = False,
     antislop_enabled: bool = True,
     regex_bans: List[str] = None,
+    repetition_penalty: float = 1.0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    no_repeat_ngram_size: int = 0,
 ) -> Union[Generator[str, None, None], List[int]]:
     """
     Wrapper function for generate_antislop that handles both streaming and non-streaming modes.
@@ -720,6 +805,10 @@ def generate_antislop(
             antislop_enabled=antislop_enabled,
             streaming=streaming,
             stream_smoothing=stream_smoothing,
+            repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
         )
     else:
         generated_tokens = []
@@ -746,6 +835,10 @@ def generate_antislop(
             antislop_enabled=antislop_enabled,
             streaming=streaming,
             stream_smoothing=stream_smoothing,            
+            repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
         ):
             generated_tokens.append(token)
         return generated_tokens
@@ -779,6 +872,10 @@ def _generate_antislop(
     enforce_json: bool = False,
     antislop_enabled: bool = True,
     regex_bans: List[str] = None,
+    repetition_penalty: float = 1.0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    no_repeat_ngram_size: int = 0,
 ) -> Generator[int, None, None]:
     """
     Generates text while avoiding overrepresented phrases (slop).
@@ -807,6 +904,10 @@ def _generate_antislop(
         enforce_json=enforce_json,
         antislop_enabled=antislop_enabled,
         regex_bans=regex_bans,
+        repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,
     )
 
     # Generate token stream
@@ -817,6 +918,10 @@ def _generate_antislop(
         'top_k': top_k,
         'top_p': top_p,
         'min_p': min_p,
+        'repetition_penalty': repetition_penalty,
+        'presence_penalty': presence_penalty,
+        'frequency_penalty': frequency_penalty,
+        'no_repeat_ngram_size': no_repeat_ngram_size,
     }
 
     loop = asyncio.new_event_loop()
